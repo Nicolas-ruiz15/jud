@@ -1,18 +1,54 @@
 // pages/api/chat/start.js - CONECTADA AL MOTOR DE CHATBOT
 import { query } from '../../../lib/database';
-import { AdvancedMultiEngineChatbot } from '../../../lib/chatbot/engine.js';
+import { getChatbotInstance } from '../../../lib/chatbot/chatbotInstance';
 
-let chatbotEngine = null;
+let cachedEngineInfo = null;
+let cachedEngineInfoTimestamp = 0;
+const ENGINE_INFO_TTL = 60 * 1000; // 60 segundos
 
 // Inicializar el motor del chatbot
 async function getChatbotEngine() {
-  if (!chatbotEngine) {
-    console.log('🤖 Inicializando motor del chatbot en Start API...');
-    chatbotEngine = new AdvancedMultiEngineChatbot();
-    await chatbotEngine.initialize();
-    console.log('✅ Motor del chatbot listo en Start API');
+  try {
+    return await getChatbotInstance();
+  } catch (error) {
+    console.error('❌ No se pudo obtener instancia del motor en Start API:', error);
+    throw error;
   }
-  return chatbotEngine;
+}
+
+async function getEngineMetadata(engine) {
+  if (!engine) {
+    return { connected: false, version: 'unknown' };
+  }
+
+  const now = Date.now();
+  if (cachedEngineInfo && (now - cachedEngineInfoTimestamp) < ENGINE_INFO_TTL) {
+    return cachedEngineInfo;
+  }
+
+  let version = engine.constructor?.name || 'UltraMasterJudaicaChatbot';
+  try {
+    const info = typeof engine.getSystemInfo === 'function'
+      ? await engine.getSystemInfo()
+      : null;
+
+    if (info) {
+      version = info.systemName || version;
+      cachedEngineInfo = {
+        connected: info.isInitialized !== false,
+        version,
+        health: info.health,
+      };
+    } else {
+      cachedEngineInfo = { connected: true, version };
+    }
+  } catch (error) {
+    console.warn('⚠️ No se pudo obtener metadata del motor:', error.message);
+    cachedEngineInfo = { connected: true, version };
+  }
+
+  cachedEngineInfoTimestamp = now;
+  return cachedEngineInfo;
 }
 
 // Función para generar session_id único y seguro
@@ -277,9 +313,10 @@ export default async function handler(req, res) {
 
 Para consultas rápidas: https://wa.me/573009291156`;
     
+    let engine = null;
     try {
       // Usar el motor para generar mensaje de bienvenida inteligente
-      const engine = await getChatbotEngine();
+      engine = await getChatbotEngine();
       const welcomeContext = {
         intent: { type: 'greeting', confidence: 1.0 },
         searchResults: [],
@@ -380,6 +417,8 @@ Para consultas rápidas: https://wa.me/573009291156`;
     });
 
     // RESPUESTA EXITOSA
+    const engineInfo = await getEngineMetadata(engine);
+
     res.status(200).json({
       success: true,
       data: {
@@ -398,8 +437,9 @@ Para consultas rápidas: https://wa.me/573009291156`;
           city: 'Bogotá'
         },
         engineInfo: {
-          connected: true,
-          version: 'AdvancedMultiEngineChatbot'
+          connected: engineInfo.connected,
+          version: engineInfo.version,
+          health: engineInfo.health || null
         },
         timestamp: new Date().toISOString()
       },
