@@ -1,6 +1,10 @@
 // pages/api/chat/status.js - CORREGIDA CON IMPORT CORRECTO
 import { query } from '../../../lib/database';
-import { AdvancedMultiEngineChatbot } from '../../../lib/chatbot/engine.js'; // CORRECCIÓN: Import correcto
+import {
+  getChatbotInstance,
+  getChatbotStatus,
+  healthCheckChatbot
+} from '../../../lib/chatbot/chatbotInstance';
 
 // Función para verificar horarios de negocio (Colombia)
 function isBusinessHours() {
@@ -63,22 +67,14 @@ const engineMetricsCache = {
   ttl: 60000 // 1 minuto para métricas del motor
 };
 
-let engineInstance = null;
-
 // Función para obtener instancia del motor
 async function getEngineInstance() {
-  if (!engineInstance) {
-    try {
-      console.log('🤖 Inicializando motor en Status API...');
-      engineInstance = new AdvancedMultiEngineChatbot();
-      await engineInstance.initialize();
-      console.log('✅ Motor inicializado en Status API');
-    } catch (error) {
-      console.error('❌ Error inicializando motor en Status API:', error);
-      engineInstance = null;
-    }
+  try {
+    return await getChatbotInstance();
+  } catch (error) {
+    console.error('❌ Error obteniendo instancia del motor en Status API:', error);
+    return null;
   }
-  return engineInstance;
 }
 
 export default async function handler(req, res) {
@@ -165,17 +161,26 @@ export default async function handler(req, res) {
       avg_response_time: 0
     };
 
+    const basicEngineStatus = getChatbotStatus();
+
     // MÉTRICAS DEL MOTOR CONECTADO
     let aiPerformance = null;
     let engineStats = null;
     let engineConnected = false;
+    let engineVersion = 'unknown';
+    let engineHealthDetails = null;
+    let databaseStatus = null;
 
     if (aiEngineEnabled && includeMetrics === 'true') {
       // Verificar cache de métricas del motor
       if (engineMetricsCache.data && (now - engineMetricsCache.timestamp) < engineMetricsCache.ttl) {
-        aiPerformance = engineMetricsCache.data.performance;
-        engineStats = engineMetricsCache.data.stats;
-        engineConnected = engineMetricsCache.data.connected;
+        const cachedMetrics = engineMetricsCache.data;
+        aiPerformance = cachedMetrics.performance;
+        engineStats = cachedMetrics.stats;
+        engineConnected = cachedMetrics.connected;
+        engineHealthDetails = cachedMetrics.health || null;
+        engineVersion = cachedMetrics.version || engineVersion;
+        databaseStatus = cachedMetrics.database || null;
       } else {
         try {
           // Obtener métricas de rendimiento de la IA (últimas 24 horas)
@@ -210,10 +215,17 @@ export default async function handler(req, res) {
           try {
             const engine = await getEngineInstance();
             if (engine) {
-              // Usar método correcto para obtener stats
-              engineStats = engine.getSystemInfo ? engine.getSystemInfo() : null;
-              engineConnected = true;
+              const info = typeof engine.getSystemInfo === 'function'
+                ? await engine.getSystemInfo()
+                : null;
+
+              engineStats = info || null;
+              engineConnected = !!info?.isInitialized || !!engine;
+              engineVersion = info?.systemName || engine.constructor?.name || 'UltraMasterJudaicaChatbot';
+              databaseStatus = info?.database || null;
               console.log('✅ Motor conectado y stats obtenidos');
+            } else {
+              engineStats = { available: false, reason: 'engine_unavailable' };
             }
           } catch (engineError) {
             console.log('⚠️ Motor no disponible para estadísticas:', engineError.message);
@@ -223,6 +235,16 @@ export default async function handler(req, res) {
               error: engineError.message
             };
             engineConnected = false;
+          }
+
+          if (engineConnected) {
+            try {
+              engineHealthDetails = await healthCheckChatbot();
+              databaseStatus = engineHealthDetails?.database || databaseStatus;
+            } catch (healthError) {
+              console.log('⚠️ Error verificando salud del motor:', healthError.message);
+              engineHealthDetails = { healthy: false, reason: healthError.message };
+            }
           }
 
           aiPerformance = {
@@ -243,10 +265,13 @@ export default async function handler(req, res) {
           };
 
           // Guardar en cache
-          engineMetricsCache.data = { 
-            performance: aiPerformance, 
+          engineMetricsCache.data = {
+            performance: aiPerformance,
             stats: engineStats,
-            connected: engineConnected
+            connected: engineConnected,
+            health: engineHealthDetails,
+            version: engineVersion,
+            database: databaseStatus
           };
           engineMetricsCache.timestamp = now;
 
@@ -259,6 +284,22 @@ export default async function handler(req, res) {
           engineConnected = false;
         }
       }
+    }
+
+    if (engineVersion === 'unknown' && basicEngineStatus?.engineType) {
+      engineVersion = basicEngineStatus.engineType;
+    }
+
+    if (!engineConnected && basicEngineStatus?.isInitialized) {
+      engineConnected = true;
+    }
+
+    if (!engineHealthDetails && basicEngineStatus?.hasError === false) {
+      engineHealthDetails = { healthy: true, mode: basicEngineStatus.mode };
+    }
+
+    if (!databaseStatus) {
+      databaseStatus = engineHealthDetails?.database || basicEngineStatus?.database || null;
     }
 
     // INFORMACIÓN ESPECÍFICA DE SESIÓN CON DETECCIÓN DE AGENTE
@@ -454,14 +495,17 @@ export default async function handler(req, res) {
         },
 
         // INFORMACIÓN DEL MOTOR CORREGIDO
-        aiEngine: {
+          aiEngine: {
           enabled: aiEngineEnabled,
           connected: engineConnected, // NUEVA: Estado de conexión real
           status: engineConnected ? 'connected' : 'disconnected',
           performance: aiPerformance,
           stats: engineStats,
+          statusDetails: basicEngineStatus,
+          health: engineHealthDetails || engineMetricsCache.data?.health || null,
+          database: databaseStatus,
           confidenceThreshold: config.ai_confidence_threshold || 0.7,
-          version: engineConnected ? 'AdvancedMultiEngineChatbot' : 'unknown'
+          version: engineConnected ? engineVersion : 'unknown'
         },
 
         config: {
@@ -508,7 +552,10 @@ export default async function handler(req, res) {
             (aiPerformance.totalResponses / (stats.conversations_today || 1)) : 0,
           systemEfficiency: aiPerformance ? 
             (1 - aiPerformance.escalationRate) * 100 : 0,
-          engineHealth: engineConnected ? 'healthy' : 'disconnected'
+          engineHealth: engineConnected
+            ? (engineHealthDetails?.healthy ? 'healthy' : 'degraded')
+            : 'disconnected',
+          databaseConnected: databaseStatus?.connected ?? null
         },
         
         // INFORMACIÓN DE SESIÓN MEJORADA
@@ -549,8 +596,8 @@ export default async function handler(req, res) {
       statusCache.timestamp = now;
     }
 
-    console.log('✅ Estado obtenido con motor CORRECTAMENTE CONECTADO:', { 
-      isOnline, 
+    console.log('✅ Estado obtenido con motor CORRECTAMENTE CONECTADO:', {
+      isOnline,
       activeConversations: stats.active_conversations,
       hasSession: !!sessionInfo,
       hasActiveAgent,
@@ -559,7 +606,8 @@ export default async function handler(req, res) {
       aiEnabled: aiEngineEnabled,
       engineConnected,
       aiPerformance: aiPerformance?.avgConfidence || 'N/A',
-      businessHours
+      businessHours,
+      databaseConnected: databaseStatus?.connected ?? null
     });
 
     res.status(200).json(responseData);
@@ -588,7 +636,8 @@ export default async function handler(req, res) {
           connected: false,
           status: 'error',
           performance: null,
-          version: 'unknown'
+          version: 'unknown',
+          database: { connected: false }
         },
         config: {
           welcomeMessage: "Shalom. Bienvenido a Judaica Breslov.",
@@ -611,7 +660,8 @@ export default async function handler(req, res) {
           serverLoad: 'unknown',
           agentCoverage: 'unknown',
           hasHumanSupport: false,
-          engineHealth: 'error'
+          engineHealth: 'error',
+          databaseConnected: false
         },
         session: null,
         widget: {
