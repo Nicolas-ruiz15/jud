@@ -22,17 +22,18 @@ interface UltraEngineResponse {
     metadata: {
       processingTime: number;
       sessionId: string;
-      conversationId: number;
+      conversationId: number | string;
       isJudaicaSpecialized: boolean;
       breslovContent: boolean;
       kosherValidated: boolean;
       ultraMasterEngine: boolean;
       engineVersion: string;
+      databaseStatus?: DatabaseStatus;
     };
   };
   context: {
     sessionId: string;
-    conversationId: number;
+    conversationId: number | string;
     lastIntent: string;
     messageCount: number;
   };
@@ -40,7 +41,7 @@ interface UltraEngineResponse {
 
 interface Message {
   id: number;
-  conversationId: number;
+  conversationId: number | string;
   sessionId: string;
   sender: {
     type: 'user' | 'bot' | 'agent' | 'system';
@@ -87,12 +88,21 @@ interface Message {
 }
 
 interface ChatSession {
-  conversationId: number;
+  conversationId: number | string;
   sessionId: string;
   status: 'active' | 'pending' | 'closed';
   messageCount: number;
   existing?: boolean;
   ultraMasterEngine?: boolean;
+  databaseStatus?: DatabaseStatus | null;
+}
+
+interface DatabaseStatus {
+  connected: boolean | null;
+  checkedAt?: string | null;
+  latency?: number | null;
+  error?: string | null;
+  source?: string | null;
 }
 
 const UltraJudaicaChatWidget: React.FC = () => {
@@ -111,17 +121,13 @@ const UltraJudaicaChatWidget: React.FC = () => {
   const [ultraEngineStatus, setUltraEngineStatus] = useState<'active' | 'emergency' | 'offline'>('active');
 
   // Estados para polling optimizado
-  const [pollingActive, setPollingActive] = useState(false);
-  const [lastPollingTime, setLastPollingTime] = useState<string>('');
   const [lastEngineVersion, setLastEngineVersion] = useState<string>('');
+  const [databaseStatus, setDatabaseStatus] = useState<DatabaseStatus | null>(null);
 
   // Referencias
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const pollingTimeoutRef = useRef<NodeJS.Timeout>();
   
-  const POLLING_INTERVAL = 3000; // 3 segundos para respuestas más rápidas
-
   // FUNCIONES DE PERSISTENCIA MEJORADAS
 
   const saveSessionToStorage = useCallback((session: ChatSession) => {
@@ -185,8 +191,12 @@ const UltraJudaicaChatWidget: React.FC = () => {
     
     // Detectar estado del motor
     if (response.response.metadata?.ultraMasterEngine) {
-      setUltraEngineStatus('active');
-      setLastEngineVersion(response.response.metadata.engineVersion || 'ultra-master-v2.0');
+      const metadata = response.response.metadata;
+      setUltraEngineStatus(metadata.databaseStatus?.connected === false ? 'emergency' : 'active');
+      setLastEngineVersion(metadata.engineVersion || 'ultra-master-v2.0');
+      if (metadata.databaseStatus) {
+        setDatabaseStatus(metadata.databaseStatus);
+      }
     } else {
       setUltraEngineStatus('emergency');
     }
@@ -279,7 +289,7 @@ const UltraJudaicaChatWidget: React.FC = () => {
       
       const response = await fetch('/api/chat/send', {
         method: 'POST',
-        headers: { 
+        headers: {
           'Content-Type': 'application/json',
           'X-Ultra-Master-Engine': 'true'
         },
@@ -325,14 +335,22 @@ const UltraJudaicaChatWidget: React.FC = () => {
           setIsTyping(false);
           setMessages(prev => [...prev, botMessage]);
           scrollToBottom();
-          
+
           // Actualizar contexto de sesión
           setChatSession(prev => prev ? {
             ...prev,
-            messageCount: result.context.messageCount,
-            ultraMasterEngine: result.response.metadata?.ultraMasterEngine
+            messageCount: result.context?.messageCount ?? (prev.messageCount + 1),
+            ultraMasterEngine: result.response.metadata?.ultraMasterEngine,
+            databaseStatus: result.response.metadata?.databaseStatus ?? prev.databaseStatus ?? null
           } : null);
-          
+
+          if (result.response.metadata?.databaseStatus) {
+            setDatabaseStatus(result.response.metadata.databaseStatus);
+            if (result.response.metadata.databaseStatus.connected === false) {
+              setUltraEngineStatus('emergency');
+            }
+          }
+
         }, Math.min(result.response.metadata?.processingTime || 1000, 2000));
 
       } else {
@@ -405,7 +423,7 @@ const UltraJudaicaChatWidget: React.FC = () => {
 
       const response = await fetch('/api/chat/start', {
         method: 'POST',
-        headers: { 
+        headers: {
           'Content-Type': 'application/json',
           'X-Ultra-Master-Engine': 'true'
         },
@@ -422,21 +440,46 @@ const UltraJudaicaChatWidget: React.FC = () => {
         }),
       });
 
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
       const result = await response.json();
 
       if (result.success) {
+        const engineInfo = result.data.engineInfo || {};
+        const responseDatabaseStatus: DatabaseStatus | null = result.data.databaseStatus || engineInfo.database || null;
+
+        if (responseDatabaseStatus) {
+          setDatabaseStatus(responseDatabaseStatus);
+          if (responseDatabaseStatus.connected === false) {
+            setUltraEngineStatus('emergency');
+          }
+        }
+
+        if (engineInfo.version) {
+          setLastEngineVersion(engineInfo.version);
+        }
+
         const session: ChatSession = {
           conversationId: result.data.conversationId,
           sessionId: result.data.sessionId,
           status: 'active',
           messageCount: result.data.messageCount || 0,
           existing: result.data.existing || false,
-          ultraMasterEngine: true
+          ultraMasterEngine: true,
+          databaseStatus: responseDatabaseStatus
         };
 
         setChatSession(session);
         setConnectionStatus('connected');
-        setUltraEngineStatus('active');
+        if (engineInfo.health?.status === 'healthy') {
+          setUltraEngineStatus('active');
+        } else if (responseDatabaseStatus?.connected === false) {
+          setUltraEngineStatus('emergency');
+        } else {
+          setUltraEngineStatus('active');
+        }
         
         if (result.data.existing) {
           const storedMessages = loadMessagesFromStorage();
@@ -485,9 +528,50 @@ const UltraJudaicaChatWidget: React.FC = () => {
             }
           };
 
-          setMessages([welcomeMessage]);
+          const initialMessages: Message[] = [welcomeMessage];
+
+          if (responseDatabaseStatus?.connected === false) {
+            initialMessages.push({
+              id: Date.now() + 1,
+              conversationId: session.conversationId,
+              sessionId: session.sessionId,
+              sender: {
+                type: 'system',
+                name: 'Sistema',
+                avatar: '⚠️'
+              },
+              message: {
+                type: 'text',
+                content: 'El motor Ultra Master está activo, pero la base de datos principal está fuera de línea temporalmente. Usaremos nuestro catálogo especializado sin conexión. 🕎'
+              },
+              status: {
+                isRead: false,
+                isEdited: false,
+                delivery: 'delivered',
+                isAutomated: true
+              },
+              ai: {
+                confidence: 1,
+                requiresHuman: false,
+                intent: 'system_notice',
+                suggestions: ['Ver catálogo', 'Continuar conversación'],
+                quality: {
+                  isEmergencyResponse: true,
+                  isErrorResponse: false,
+                  ultraMasterEngine: true,
+                  engineVersion: engineInfo.version || 'ultra-master-v2.0'
+                }
+              },
+              timestamps: {
+                created: new Date().toISOString(),
+                updated: new Date().toISOString()
+              }
+            });
+          }
+
+          setMessages(initialMessages);
         }
-        
+
       } else {
         throw new Error(result.message || 'Error iniciando Ultra Master Chat');
       }
@@ -509,6 +593,10 @@ const UltraJudaicaChatWidget: React.FC = () => {
       if (storedSession && storedSession.ultraMasterEngine) {
         console.log('🔄 Restaurando sesión Ultra Master...');
         setChatSession(storedSession);
+        setDatabaseStatus(storedSession.databaseStatus || null);
+        if (storedSession.databaseStatus?.connected === false) {
+          setUltraEngineStatus('emergency');
+        }
         const storedMessages = loadMessagesFromStorage();
         if (storedMessages.length > 0) {
           setMessages(storedMessages);
@@ -698,14 +786,17 @@ const UltraJudaicaChatWidget: React.FC = () => {
   };
 
   const getEngineStatusIndicator = () => {
-    switch (ultraEngineStatus) {
-      case 'active':
-        return { icon: '🚀', text: 'Ultra Master Engine activo', color: 'text-green-500' };
-      case 'emergency':
-        return { icon: '⚡', text: 'Modo emergencia', color: 'text-yellow-500' };
-      case 'offline':
-        return { icon: '⚠️', text: 'Engine offline', color: 'text-red-500' };
+    if (ultraEngineStatus === 'offline') {
+      return { icon: '⚠️', text: 'Engine offline', color: 'text-red-500' };
     }
+
+    if (databaseStatus?.connected === false) {
+      return { icon: '⚡', text: 'Modo emergencia (catálogo offline)', color: 'text-yellow-500' };
+    }
+
+    return ultraEngineStatus === 'active'
+      ? { icon: '🚀', text: 'Ultra Master Engine activo', color: 'text-green-500' }
+      : { icon: '⚡', text: 'Modo emergencia', color: 'text-yellow-500' };
   };
 
   const statusIndicator = getEngineStatusIndicator();
@@ -981,11 +1072,12 @@ const UltraJudaicaChatWidget: React.FC = () => {
                 
                 {/* Indicador de estado Ultra Master */}
                 <div className="mt-2 text-center">
-                  <span className={`text-xs font-medium flex items-center justify-center space-x-1 ${statusIndicator.color}`}>
-                    <span>{statusIndicator.icon}</span>
-                    <span>{statusIndicator.text}</span>
+                    <span className={`text-xs font-medium flex items-center justify-center space-x-1 ${statusIndicator.color}`}>
+                      <span>{statusIndicator.icon}</span>
+                      <span>{statusIndicator.text}</span>
                     {lastEngineVersion && <span>• v{lastEngineVersion}</span>}
-                  </span>
+                    {databaseStatus?.connected === false && <span>• DB offline</span>}
+                    </span>
                 </div>
               </div>
             </>
