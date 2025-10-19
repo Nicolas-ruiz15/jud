@@ -38,13 +38,22 @@ async function getEngineMetadata(engine) {
         connected: info.isInitialized !== false,
         version,
         health: info.health,
+        database: info.database || null,
       };
     } else {
-      cachedEngineInfo = { connected: true, version };
+      cachedEngineInfo = {
+        connected: true,
+        version,
+        database: info?.database || null
+      };
     }
   } catch (error) {
     console.warn('⚠️ No se pudo obtener metadata del motor:', error.message);
-    cachedEngineInfo = { connected: true, version };
+    cachedEngineInfo = {
+      connected: true,
+      version,
+      database: null
+    };
   }
 
   cachedEngineInfoTimestamp = now;
@@ -439,7 +448,8 @@ Para consultas rápidas: https://wa.me/573009291156`;
         engineInfo: {
           connected: engineInfo.connected,
           version: engineInfo.version,
-          health: engineInfo.health || null
+          health: engineInfo.health || null,
+          database: engineInfo.database || null
         },
         timestamp: new Date().toISOString()
       },

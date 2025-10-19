@@ -169,15 +169,18 @@ export default async function handler(req, res) {
     let engineConnected = false;
     let engineVersion = 'unknown';
     let engineHealthDetails = null;
+    let databaseStatus = null;
 
     if (aiEngineEnabled && includeMetrics === 'true') {
       // Verificar cache de métricas del motor
       if (engineMetricsCache.data && (now - engineMetricsCache.timestamp) < engineMetricsCache.ttl) {
-        aiPerformance = engineMetricsCache.data.performance;
-        engineStats = engineMetricsCache.data.stats;
-        engineConnected = engineMetricsCache.data.connected;
-        engineHealthDetails = engineMetricsCache.data.health || null;
-        engineVersion = engineMetricsCache.data.version || engineVersion;
+        const cachedMetrics = engineMetricsCache.data;
+        aiPerformance = cachedMetrics.performance;
+        engineStats = cachedMetrics.stats;
+        engineConnected = cachedMetrics.connected;
+        engineHealthDetails = cachedMetrics.health || null;
+        engineVersion = cachedMetrics.version || engineVersion;
+        databaseStatus = cachedMetrics.database || null;
       } else {
         try {
           // Obtener métricas de rendimiento de la IA (últimas 24 horas)
@@ -219,6 +222,7 @@ export default async function handler(req, res) {
               engineStats = info || null;
               engineConnected = !!info?.isInitialized || !!engine;
               engineVersion = info?.systemName || engine.constructor?.name || 'UltraMasterJudaicaChatbot';
+              databaseStatus = info?.database || null;
               console.log('✅ Motor conectado y stats obtenidos');
             } else {
               engineStats = { available: false, reason: 'engine_unavailable' };
@@ -236,6 +240,7 @@ export default async function handler(req, res) {
           if (engineConnected) {
             try {
               engineHealthDetails = await healthCheckChatbot();
+              databaseStatus = engineHealthDetails?.database || databaseStatus;
             } catch (healthError) {
               console.log('⚠️ Error verificando salud del motor:', healthError.message);
               engineHealthDetails = { healthy: false, reason: healthError.message };
@@ -265,7 +270,8 @@ export default async function handler(req, res) {
             stats: engineStats,
             connected: engineConnected,
             health: engineHealthDetails,
-            version: engineVersion
+            version: engineVersion,
+            database: databaseStatus
           };
           engineMetricsCache.timestamp = now;
 
@@ -290,6 +296,10 @@ export default async function handler(req, res) {
 
     if (!engineHealthDetails && basicEngineStatus?.hasError === false) {
       engineHealthDetails = { healthy: true, mode: basicEngineStatus.mode };
+    }
+
+    if (!databaseStatus) {
+      databaseStatus = engineHealthDetails?.database || basicEngineStatus?.database || null;
     }
 
     // INFORMACIÓN ESPECÍFICA DE SESIÓN CON DETECCIÓN DE AGENTE
@@ -493,6 +503,7 @@ export default async function handler(req, res) {
           stats: engineStats,
           statusDetails: basicEngineStatus,
           health: engineHealthDetails || engineMetricsCache.data?.health || null,
+          database: databaseStatus,
           confidenceThreshold: config.ai_confidence_threshold || 0.7,
           version: engineConnected ? engineVersion : 'unknown'
         },
@@ -543,7 +554,8 @@ export default async function handler(req, res) {
             (1 - aiPerformance.escalationRate) * 100 : 0,
           engineHealth: engineConnected
             ? (engineHealthDetails?.healthy ? 'healthy' : 'degraded')
-            : 'disconnected'
+            : 'disconnected',
+          databaseConnected: databaseStatus?.connected ?? null
         },
         
         // INFORMACIÓN DE SESIÓN MEJORADA
@@ -584,8 +596,8 @@ export default async function handler(req, res) {
       statusCache.timestamp = now;
     }
 
-    console.log('✅ Estado obtenido con motor CORRECTAMENTE CONECTADO:', { 
-      isOnline, 
+    console.log('✅ Estado obtenido con motor CORRECTAMENTE CONECTADO:', {
+      isOnline,
       activeConversations: stats.active_conversations,
       hasSession: !!sessionInfo,
       hasActiveAgent,
@@ -594,7 +606,8 @@ export default async function handler(req, res) {
       aiEnabled: aiEngineEnabled,
       engineConnected,
       aiPerformance: aiPerformance?.avgConfidence || 'N/A',
-      businessHours
+      businessHours,
+      databaseConnected: databaseStatus?.connected ?? null
     });
 
     res.status(200).json(responseData);
@@ -623,7 +636,8 @@ export default async function handler(req, res) {
           connected: false,
           status: 'error',
           performance: null,
-          version: 'unknown'
+          version: 'unknown',
+          database: { connected: false }
         },
         config: {
           welcomeMessage: "Shalom. Bienvenido a Judaica Breslov.",
@@ -646,7 +660,8 @@ export default async function handler(req, res) {
           serverLoad: 'unknown',
           agentCoverage: 'unknown',
           hasHumanSupport: false,
-          engineHealth: 'error'
+          engineHealth: 'error',
+          databaseConnected: false
         },
         session: null,
         widget: {
