@@ -1,18 +1,74 @@
 // pages/api/chat/start.js - CONECTADA AL MOTOR DE CHATBOT
 import { query } from '../../../lib/database';
-import { AdvancedMultiEngineChatbot } from '../../../lib/chatbot/engine.js';
+import { getChatbotInstance } from '../../../lib/chatbot/chatbotInstance';
 
-let chatbotEngine = null;
+let cachedEngineInfo = null;
+let cachedEngineInfoTimestamp = 0;
+const ENGINE_INFO_TTL = 60 * 1000; // 60 segundos
+const OFFLINE_SESSION_PREFIX = 'offline_';
+
+function createDatabaseStatus(overrides = {}) {
+  return {
+    connected: overrides.connected ?? true,
+    checkedAt: overrides.checkedAt || new Date().toISOString(),
+    latency: overrides.latency ?? null,
+    error: overrides.error ?? null,
+    source: overrides.source || 'chat-start'
+  };
+}
 
 // Inicializar el motor del chatbot
 async function getChatbotEngine() {
-  if (!chatbotEngine) {
-    console.log('🤖 Inicializando motor del chatbot en Start API...');
-    chatbotEngine = new AdvancedMultiEngineChatbot();
-    await chatbotEngine.initialize();
-    console.log('✅ Motor del chatbot listo en Start API');
+  try {
+    return await getChatbotInstance();
+  } catch (error) {
+    console.error('❌ No se pudo obtener instancia del motor en Start API:', error);
+    throw error;
   }
-  return chatbotEngine;
+}
+
+async function getEngineMetadata(engine) {
+  if (!engine) {
+    return { connected: false, version: 'unknown' };
+  }
+
+  const now = Date.now();
+  if (cachedEngineInfo && (now - cachedEngineInfoTimestamp) < ENGINE_INFO_TTL) {
+    return cachedEngineInfo;
+  }
+
+  let version = engine.constructor?.name || 'UltraMasterJudaicaChatbot';
+  try {
+    const info = typeof engine.getSystemInfo === 'function'
+      ? await engine.getSystemInfo()
+      : null;
+
+    if (info) {
+      version = info.systemName || version;
+      cachedEngineInfo = {
+        connected: info.isInitialized !== false,
+        version,
+        health: info.health,
+        database: info.database || null,
+      };
+    } else {
+      cachedEngineInfo = {
+        connected: true,
+        version,
+        database: info?.database || null
+      };
+    }
+  } catch (error) {
+    console.warn('⚠️ No se pudo obtener metadata del motor:', error.message);
+    cachedEngineInfo = {
+      connected: true,
+      version,
+      database: null
+    };
+  }
+
+  cachedEngineInfoTimestamp = now;
+  return cachedEngineInfo;
 }
 
 // Función para generar session_id único y seguro
@@ -73,10 +129,32 @@ export default async function handler(req, res) {
     });
   }
 
+  let databaseStatus = createDatabaseStatus();
+  let databaseAvailable = true;
+
+  const safeQuery = async (sql, params = []) => {
+    if (!databaseAvailable) {
+      return null;
+    }
+
+    try {
+      return await query(sql, params);
+    } catch (error) {
+      databaseAvailable = false;
+      databaseStatus = createDatabaseStatus({
+        connected: false,
+        error: error.message,
+        source: 'chat-start-query'
+      });
+      console.warn('⚠️ Base de datos no disponible para chat/start:', error.message);
+      return null;
+    }
+  };
+
   try {
-    const { 
-      userId = null, 
-      visitorName = null, 
+    const {
+      userId = null,
+      visitorName = null,
       visitorEmail = null,
       visitorPhone = null,
       landingPage = null,
@@ -104,35 +182,35 @@ export default async function handler(req, res) {
     // BUSCAR CONVERSACIÓN EXISTENTE ACTIVA
     let existingConversation = null;
     
-    if (existingSessionId) {
+    if (existingSessionId && databaseAvailable) {
       // Buscar por session_id específico
-      const conversations = await query(`
+      const conversations = await safeQuery(`
         SELECT id, session_id, created_at, message_count, last_message_at
-        FROM chat_conversations 
+        FROM chat_conversations
         WHERE session_id = ? AND status = 'active'
-        ORDER BY created_at DESC 
+        ORDER BY created_at DESC
         LIMIT 1
       `, [existingSessionId]);
-      
-      if (conversations.length > 0) {
+
+      if (conversations && conversations.length > 0) {
         existingConversation = conversations[0];
       }
-    } else {
+    } else if (databaseAvailable) {
       // Buscar conversación reciente para esta IP (últimos 30 minutos)
-      const recentConversations = await query(`
+      const recentConversations = await safeQuery(`
         SELECT id, session_id, created_at, message_count, last_message_at
-        FROM chat_conversations 
-        WHERE ip_address = ? 
-          AND status = 'active' 
+        FROM chat_conversations
+        WHERE ip_address = ?
+          AND status = 'active'
           AND created_at > DATE_SUB(NOW(), INTERVAL 30 MINUTE)
         ORDER BY created_at DESC 
         LIMIT 1
       `, [ip]);
       
-      if (recentConversations.length > 0) {
+      if (recentConversations && recentConversations.length > 0) {
         const recent = recentConversations[0];
         const timeDiff = Date.now() - new Date(recent.created_at).getTime();
-        
+
         // Si es menos de 10 minutos, reusar la conversación
         if (timeDiff < 10 * 60 * 1000) {
           existingConversation = recent;
@@ -143,20 +221,23 @@ export default async function handler(req, res) {
     // Si existe conversación activa, reanudarla
     if (existingConversation) {
       console.log('♻️ Reanudando conversación existente:', existingConversation.session_id);
-      
+
       // Actualizar información de la conversación existente
-      await query(`
-        UPDATE chat_conversations 
-        SET current_page = ?, 
+      if (databaseAvailable) {
+        await safeQuery(`
+        UPDATE chat_conversations
+        SET current_page = ?,
             referrer = ?,
             last_message_at = NOW(),
             updated_at = NOW()
         WHERE id = ?
       `, [currentPage || landingPage, referrer, existingConversation.id]);
+      }
 
       // MENSAJE DE BIENVENIDA CONECTADO AL MOTOR
       let welcomeMessage = "Shalom. Bienvenido de vuelta a Judaica Breslov Colombia.";
-      
+      let engineMetadata = null;
+
       try {
         // Usar el motor para generar mensaje de bienvenida personalizado
         const engine = await getChatbotEngine();
@@ -170,21 +251,25 @@ export default async function handler(req, res) {
             browser
           }
         };
-        
+
         const welcomeResponse = await engine.processMessage(
-          'hola', 
-          existingConversation.id, 
-          existingConversation.session_id, 
+          'hola',
+          existingConversation.id,
+          existingConversation.session_id,
           welcomeContext
         );
-        
+
         if (welcomeResponse.success) {
           welcomeMessage = welcomeResponse.response;
         }
+
+        engineMetadata = await getEngineMetadata(engine);
       } catch (engineError) {
         console.log('⚠️ Error generando bienvenida con motor:', engineError.message);
       }
-      
+
+      const mergedDatabaseStatus = engineMetadata?.database || databaseStatus;
+
       return res.status(200).json({
         success: true,
         data: {
@@ -195,6 +280,16 @@ export default async function handler(req, res) {
           existing: true,
           messageCount: existingConversation.message_count,
           lastActivity: existingConversation.last_message_at,
+          engineInfo: engineMetadata
+            ? {
+                connected: engineMetadata.connected,
+                version: engineMetadata.version,
+                health: engineMetadata.health || null,
+                database: mergedDatabaseStatus
+              }
+            : null,
+          databaseStatus: mergedDatabaseStatus,
+          offline: mergedDatabaseStatus?.connected === false,
           timestamp: new Date().toISOString()
         },
         message: 'Conversación reanudada con motor conectado'
@@ -202,34 +297,39 @@ export default async function handler(req, res) {
     }
 
     // CREAR NUEVA CONVERSACIÓN
-    const sessionId = generateSessionId();
-    
+    const sessionId = existingConversation?.session_id || existingSessionId || generateSessionId();
+
     console.log('🆕 Creando nueva conversación con motor:', sessionId.substring(0, 20) + '...');
 
-    const conversationResult = await query(`
+    let conversationResult = null;
+
+    if (databaseAvailable) {
+      conversationResult = await safeQuery(`
       INSERT INTO chat_conversations (
         session_id, user_id, visitor_name, visitor_email, visitor_phone,
         ip_address, user_agent, device_type, browser,
         country, city, timezone,
-        landing_page, current_page, referrer, 
-        utm_source, utm_medium, utm_campaign, 
-        status, priority, department, message_count, 
+        landing_page, current_page, referrer,
+        utm_source, utm_medium, utm_campaign,
+        status, priority, department, message_count,
         created_at, updated_at, last_message_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Colombia', 'Bogotá', 'America/Bogota', ?, ?, ?, ?, ?, ?, 'active', 'normal', 'sales', 0, NOW(), NOW(), NOW())
-    `, [
-      sessionId, userId, visitorName, visitorEmail, visitorPhone,
-      ip, userAgent, deviceType, browser,
-      landingPage, currentPage, referrer,
-      utmSource, utmMedium, utmCampaign
-    ]);
+      `, [
+        sessionId, userId, visitorName, visitorEmail, visitorPhone,
+        ip, userAgent, deviceType, browser,
+        landingPage, currentPage, referrer,
+        utmSource, utmMedium, utmCampaign
+      ]);
+    }
 
-    const conversationId = conversationResult.insertId;
+    let conversationId = conversationResult?.insertId;
 
     // Registrar visitante en tiempo real si la tabla existe
     try {
-      const realtimeTableExists = await query("SHOW TABLES LIKE 'analytics_realtime_visitors'");
-      if (realtimeTableExists.length > 0) {
-        await query(`
+      if (databaseAvailable) {
+        const realtimeTableExists = await safeQuery("SHOW TABLES LIKE 'analytics_realtime_visitors'");
+        if (realtimeTableExists && realtimeTableExists.length > 0) {
+          await safeQuery(`
           INSERT INTO analytics_realtime_visitors (
             session_id, user_id, current_page_url, current_page_title,
             current_page_path, device_type, country, city, referrer,
@@ -240,13 +340,14 @@ export default async function handler(req, res) {
             current_page_url = VALUES(current_page_url),
             page_views = page_views + 1
         `, [
-          sessionId, userId, currentPage || landingPage || 'https://judaicabreslovcolombia.com/chat', 
-          'Chat en Vivo - Judaica Breslov', 
-          currentPage || landingPage || '/chat',
-          deviceType, 'CO', 'Bogotá', referrer
-        ]);
-        
-        console.log('✅ Visitante registrado en tiempo real');
+            sessionId, userId, currentPage || landingPage || 'https://judaicabreslovcolombia.com/chat',
+            'Chat en Vivo - Judaica Breslov',
+            currentPage || landingPage || '/chat',
+            deviceType, 'CO', 'Bogotá', referrer
+          ]);
+
+          console.log('✅ Visitante registrado en tiempo real');
+        }
       }
     } catch (realtimeError) {
       console.warn('⚠️ No se pudo registrar visitante en tiempo real:', realtimeError.message);
@@ -254,17 +355,19 @@ export default async function handler(req, res) {
 
     // Crear contexto de conversación para IA
     try {
-      const contextTableExists = await query("SHOW TABLES LIKE 'chat_conversation_context'");
-      if (contextTableExists.length > 0) {
-        await query(`
+      if (databaseAvailable) {
+        const contextTableExists = await safeQuery("SHOW TABLES LIKE 'chat_conversation_context'");
+        if (contextTableExists && contextTableExists.length > 0) {
+          await safeQuery(`
           INSERT INTO chat_conversation_context (
-            conversation_id, session_id, conversation_stage, 
+            conversation_id, session_id, conversation_stage,
             intent_history, user_preferences, products_mentioned,
             created_at, updated_at
           ) VALUES (?, ?, 'greeting', '[]', '{}', '[]', NOW(), NOW())
         `, [conversationId, sessionId]);
-        
-        console.log('✅ Contexto IA creado');
+
+          console.log('✅ Contexto IA creado');
+        }
       }
     } catch (contextError) {
       console.warn('⚠️ No se pudo crear contexto IA:', contextError.message);
@@ -277,9 +380,10 @@ export default async function handler(req, res) {
 
 Para consultas rápidas: https://wa.me/573009291156`;
     
+    let engine = null;
     try {
       // Usar el motor para generar mensaje de bienvenida inteligente
-      const engine = await getChatbotEngine();
+      engine = await getChatbotEngine();
       const welcomeContext = {
         intent: { type: 'greeting', confidence: 1.0 },
         searchResults: [],
@@ -311,42 +415,47 @@ Para consultas rápidas: https://wa.me/573009291156`;
     }
 
     // CREAR MENSAJE DE BIENVENIDA EN BD
-    const messageResult = await query(`
+    if (databaseAvailable && conversationId) {
+      await safeQuery(`
       INSERT INTO chat_messages (
-        conversation_id, session_id, sender_type, sender_name, 
+        conversation_id, session_id, sender_type, sender_name,
         message_type, message_content, metadata, is_automated,
         delivery_status, created_at, updated_at
       ) VALUES (?, ?, 'bot', 'Asistente Judaica Breslov', 'text', ?, ?, 1, 'sent', NOW(), NOW())
-    `, [
-      conversationId, 
-      sessionId, 
-      welcomeMessage,
-      JSON.stringify({ 
-        welcome: true, 
-        auto_generated: true,
-        generated_by_engine: true,
-        device_type: deviceType,
-        browser: browser,
-        version: 'v2.0-motor-conectado'
-      })
-    ]);
+      `, [
+        conversationId,
+        sessionId,
+        welcomeMessage,
+        JSON.stringify({
+          welcome: true,
+          auto_generated: true,
+          generated_by_engine: true,
+          device_type: deviceType,
+          browser: browser,
+          version: 'v2.0-motor-conectado'
+        })
+      ]);
+    }
 
     // Actualizar contador de mensajes
-    await query(
-      'UPDATE chat_conversations SET message_count = 1, last_message_at = NOW() WHERE id = ?',
-      [conversationId]
-    );
+    if (databaseAvailable && conversationId) {
+      await safeQuery(
+        'UPDATE chat_conversations SET message_count = 1, last_message_at = NOW() WHERE id = ?',
+        [conversationId]
+      );
+    }
 
     // Registrar en analytics si existe
     try {
-      const analyticsExists = await query("SHOW TABLES LIKE 'chat_analytics'");
-      if (analyticsExists.length > 0) {
-        const today = new Date().toISOString().split('T')[0];
-        const currentHour = new Date().getHours();
-        
-        await query(`
+      if (databaseAvailable) {
+        const analyticsExists = await safeQuery("SHOW TABLES LIKE 'chat_analytics'");
+        if (analyticsExists && analyticsExists.length > 0) {
+          const today = new Date().toISOString().split('T')[0];
+          const currentHour = new Date().getHours();
+
+        await safeQuery(`
           INSERT INTO chat_analytics (
-            date, hour, new_conversations, total_messages, 
+            date, hour, new_conversations, total_messages,
             mobile_conversations, desktop_conversations, tablet_conversations,
             created_at, updated_at
           ) VALUES (?, ?, 1, 1, ?, ?, ?, NOW(), NOW())
@@ -358,28 +467,40 @@ Para consultas rápidas: https://wa.me/573009291156`;
             tablet_conversations = tablet_conversations + ?,
             updated_at = NOW()
         `, [
-          today, currentHour,
-          deviceType === 'mobile' ? 1 : 0,
-          deviceType === 'desktop' ? 1 : 0,
-          deviceType === 'tablet' ? 1 : 0,
-          deviceType === 'mobile' ? 1 : 0,
-          deviceType === 'desktop' ? 1 : 0,
-          deviceType === 'tablet' ? 1 : 0
-        ]);
+            today, currentHour,
+            deviceType === 'mobile' ? 1 : 0,
+            deviceType === 'desktop' ? 1 : 0,
+            deviceType === 'tablet' ? 1 : 0,
+            deviceType === 'mobile' ? 1 : 0,
+            deviceType === 'desktop' ? 1 : 0,
+            deviceType === 'tablet' ? 1 : 0
+          ]);
+        }
       }
     } catch (analyticsError) {
       console.warn('⚠️ Chat analytics no disponible');
     }
 
-    console.log('🎉 CONVERSACIÓN CREADA CON MOTOR:', { 
-      conversationId, 
+    if (!conversationId) {
+      conversationId = `${OFFLINE_SESSION_PREFIX}${sessionId}`;
+    }
+
+    const messageCount = existingConversation?.message_count ?? (existingSessionId ? 0 : 1);
+
+    const engineInfo = await getEngineMetadata(engine);
+    const mergedDatabaseStatus = databaseStatus.connected === false
+      ? databaseStatus
+      : engineInfo.database || databaseStatus;
+
+    console.log('🎉 CONVERSACIÓN CREADA CON MOTOR:', {
+      conversationId,
       sessionId: sessionId.substring(0, 20) + '...',
       deviceType,
       browser,
-      engineConnected: true
+      engineConnected: true,
+      databaseConnected: mergedDatabaseStatus.connected
     });
 
-    // RESPUESTA EXITOSA
     res.status(200).json({
       success: true,
       data: {
@@ -387,8 +508,8 @@ Para consultas rápidas: https://wa.me/573009291156`;
         sessionId,
         welcomeMessage,
         status: 'active',
-        existing: false,
-        messageCount: 1,
+        existing: existingConversation ? true : Boolean(existingSessionId),
+        messageCount,
         deviceInfo: {
           type: deviceType,
           browser: browser
@@ -398,9 +519,13 @@ Para consultas rápidas: https://wa.me/573009291156`;
           city: 'Bogotá'
         },
         engineInfo: {
-          connected: true,
-          version: 'AdvancedMultiEngineChatbot'
+          connected: engineInfo.connected,
+          version: engineInfo.version,
+          health: engineInfo.health || null,
+          database: mergedDatabaseStatus
         },
+        databaseStatus: mergedDatabaseStatus,
+        offline: mergedDatabaseStatus.connected === false,
         timestamp: new Date().toISOString()
       },
       message: 'Conversación iniciada con motor de IA conectado'
@@ -416,7 +541,9 @@ Para consultas rápidas: https://wa.me/573009291156`;
         action: 'reload_page',
         contact: 'WhatsApp: +57 300 929 1156',
         engineStatus: 'disconnected'
-      }
+      },
+      databaseStatus,
+      offline: databaseStatus.connected === false
     });
   }
 }

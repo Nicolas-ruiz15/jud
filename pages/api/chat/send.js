@@ -100,10 +100,10 @@ Por favor intenta nuevamente en unos segundos.`,
         finalSessionId,
         enhancedUserContext
       );
-      
+
       console.log('🤖 Ultra Master Engine respondió exitosamente');
       console.log(`📊 Intent: ${ultraResponse.intent}, Confianza: ${ultraResponse.confidence}`);
-      
+
     } catch (processingError) {
       console.error('❌ Error en Ultra Master Engine:', processingError);
       
@@ -132,9 +132,19 @@ Por favor intenta nuevamente en unos segundos.`,
 
     // Validar y normalizar respuesta del Ultra Master Engine
     const normalizedResponse = normalizeUltraResponse(ultraResponse);
+    const sessionStats = typeof chatbotInstance.getSessionStats === 'function'
+      ? chatbotInstance.getSessionStats(finalSessionId)
+      : null;
+
+    if (sessionStats?.databaseStatus && !normalizedResponse.metadata?.databaseStatus) {
+      normalizedResponse.metadata = {
+        ...(normalizedResponse.metadata || {}),
+        databaseStatus: sessionStats.databaseStatus
+      };
+    }
 
     const processingTime = Date.now() - startTime;
-    
+
     console.log(`✅ Solicitud completada en ${processingTime}ms`);
 
     // Respuesta en el formato esperado por el frontend
@@ -161,7 +171,7 @@ Por favor intenta nuevamente en unos segundos.`,
         sessionId: finalSessionId,
         conversationId: finalConversationId,
         lastIntent: normalizedResponse.intent,
-        messageCount: 1
+        messageCount: sessionStats?.messageCount || normalizedResponse.metadata?.messageCount || 1
       }
     });
 
